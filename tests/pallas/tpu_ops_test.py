@@ -1632,6 +1632,54 @@ class OpsTest(ptu.PallasTPUTest):
     np.testing.assert_array_equal(two_bits_out, two_bits_in)
     np.testing.assert_array_equal(four_bits_out, four_bits_in)
 
+  @parameterized.parameters(jnp.float6_e3m2fn, jnp.float6_e2m3fn)
+  def test_fp6_block_mapping_validation(self, fp6_dtype):
+    if self.INTERPRET:
+      self.skipTest("TPU Mosaic block mapping validation test")
+    if not jtu.is_device_tpu_at_least(version=5):
+      self.skipTest("Requires TPUv5+")
+
+    def copy_kernel(x_ref, y_ref):
+      y_ref[...] = x_ref[...]
+
+    with self.assertRaisesRegex(ValueError, "divisible by 16 and 128"):
+      jax.jit(
+          self.pallas_call(
+              copy_kernel,
+              out_shape=jax.ShapeDtypeStruct((32, 128), fp6_dtype),
+              in_specs=[pl.BlockSpec((8, 128), lambda i: (i, 0))],
+              out_specs=pl.BlockSpec((8, 128), lambda i: (i, 0)),
+              grid=(4,),
+          )
+      ).lower(jax.ShapeDtypeStruct((32, 128), fp6_dtype))
+
+    with self.assertRaisesRegex(
+        ValueError, r"multiple of 2048.*tiling size \(2048 = 128 \* 16\)"
+    ):
+      jax.jit(
+          self.pallas_call(
+              copy_kernel,
+              out_shape=jax.ShapeDtypeStruct((4096,), fp6_dtype),
+              in_specs=[pl.BlockSpec((1024,), lambda i: (i,))],
+              out_specs=pl.BlockSpec((1024,), lambda i: (i,)),
+              grid=(4,),
+          )
+      ).lower(jax.ShapeDtypeStruct((4096,), fp6_dtype))
+
+    if not jtu.is_libtpu_at_least("0.0.52"):
+      self.skipTest("Requires libtpu >= 0.0.52")
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(32, 128)).astype(fp6_dtype)
+    y = self.pallas_call(
+        copy_kernel,
+        out_shape=jax.ShapeDtypeStruct((32, 128), fp6_dtype),
+        in_specs=[pl.BlockSpec((16, 128), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((16, 128), lambda i: (i, 0)),
+        grid=(2,),
+    )(x)
+    np.testing.assert_array_equal(np.asarray(y), x)
+
   def test_load_transpose_with_sliced_leading_dim(self) -> None:
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Requires TPUv5+")

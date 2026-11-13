@@ -1023,9 +1023,18 @@ def _check_block_mappings(
       bs1, as1 = 1, 1
 
     if rank >= 2:
+      is_fp6 = physical_dtype in (
+          dtypes.dtype("float6_e3m2fn"),
+          dtypes.dtype("float6_e2m3fn"),
+      )
+      min_second_minor = (
+          16
+          if (is_fp6 and tpu_info.get_tpu_info().generation >= 5)
+          else 8
+      )
       evenly_divisible = (
-          (bs0 == as0 or bs0 % 128 == 0) and
-          (bs1 == as1 or bs1 % 8 == 0)
+          (bs0 == as0 or bs0 % 128 == 0)
+          and (bs1 == as1 or bs1 % min_second_minor == 0)
       )
       if not evenly_divisible:
         extra_msg = ""
@@ -1033,12 +1042,14 @@ def _check_block_mappings(
           extra_msg = (
               " In dynamic shape export - your kernel symbolic args must be"
               " annotated with constraints where the computation *after*"
-              " applying any grid mapping is divisible by 8 and 128"
-              " respectively. Ex: (mod(floordiv(m_dim, grid_size), 8) == 0))"
+              f" applying any grid mapping is divisible by {min_second_minor}"
+              " and 128 respectively. Ex:"
+              f" (mod(floordiv(m_dim, grid_size), {min_second_minor}) == 0))"
           )
         raise ValueError(
             "The Pallas TPU lowering currently requires that the last two "
-            "dimensions of your block shape are divisible by 8 and 128 "
+            "dimensions of your block shape are divisible by "
+            f"{min_second_minor} and 128 "
             "respectively, or be equal to the respective dimensions of the "
             "overall array. "
             + extra_msg
@@ -1050,17 +1061,26 @@ def _check_block_mappings(
         bitwidth = dtypes.itemsize_bits(BOOL_MEMREF_TYPE)
       else:
         bitwidth = dtypes.itemsize_bits(physical_dtype)
-      packing = 32 // bitwidth
       sublane_count = tpu_info.get_tpu_info().num_sublanes
       lane_count = tpu_info.get_tpu_info().num_lanes
+      packing = (
+          (16 if tpu_info.get_tpu_info().generation >= 5 else 4)
+          if bitwidth == 6
+          else 32 // bitwidth
+      )
       min_tiling = lane_count * packing
-      chunk_size = sublane_count * lane_count
+      chunk_size = max(sublane_count * lane_count, min_tiling)
       feasible_block_size = (
           bs0 == as0
           or bs0 % chunk_size == 0
           or (bs0 >= min_tiling and (bs0 & (bs0 - 1)) == 0)  # power of 2
       )
       if not feasible_block_size:
+        packing_expr = (
+            str(packing)
+            if bitwidth == 6
+            else f"(32 // {dtypes.itemsize_bits(physical_dtype)})"
+        )
         raise ValueError(
             "The Pallas TPU lowering currently requires that rank 1 block"
             " shapes, either 1) the first (and only) dimension of the block"
@@ -1068,8 +1088,8 @@ def _check_block_mappings(
             " shape, or 2) the first (and only) dimension of the block shape"
             f" is a multiple of {chunk_size}, or 3) the first (and only)"
             " dimension of the block shape is a power of 2 and at least the"
-            f" tiling size ({min_tiling} = 128 * (32 //"
-            f" {dtypes.itemsize_bits(physical_dtype)})) of the array shape. "
+            f" tiling size ({min_tiling} = {lane_count} * {packing_expr}) of"
+            " the array shape. "
             + err_details()
         )
 
@@ -3325,6 +3345,10 @@ def _convert_helper(x: Array, *, to_dtype: jnp.dtype) -> Array:
     # unsigned -> float is unsupported. We fall through and raise at the bottom.
     if not jnp.issubdtype(to_dtype, jnp.floating):
       return x.astype(to_dtype)
+  if jnp.issubdtype(from_dtype, jnp.floating) and jnp.issubdtype(
+      to_dtype, jnp.floating
+  ):
+    return x.astype(jnp.float32).astype(to_dtype)
   raise NotImplementedError(f"Unsupported cast: {from_dtype} -> {to_dtype}")
 
 
@@ -5310,9 +5334,9 @@ def _bitcast_lowering_rule(ctx: LoweringRuleContext, x, *, ty, dim):
     return tpu.bitcast(out_type, x)
   assert dim == in_aval.ndim - 1, (dim, in_aval.ndim)
   if ctx.lowering_context.kernel_type == tpu_core.CoreType.TC:
-    if dtypes.itemsize_bits(in_aval.dtype) != dtypes.itemsize_bits(
-        out_aval.dtype
-    ):
+    if tpu_primitives._vreg_bitwidth(
+        in_aval.dtype
+    ) != tpu_primitives._vreg_bitwidth(out_aval.dtype):
       raise NotImplementedError(
           "Bitcasting along the minormost dimension between different"
           " bitwidths is not supported on TensorCore."
