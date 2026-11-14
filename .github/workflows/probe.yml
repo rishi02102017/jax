@@ -1,0 +1,30 @@
+name: probe
+on:
+  push:
+    branches: ['ci/probe-*']
+  workflow_dispatch:
+jobs:
+  run:
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [release, nightly]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install
+        run: |
+          python -m pip install -U pip
+          if [ "${{ matrix.flavor }}" = release ]; then
+            pip install -U "jax[cpu]" numpy scipy
+          else
+            pip install -U numpy scipy
+            pip install -U --pre jax jaxlib -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ --extra-index-url https://pypi.org/simple
+          fi
+          pip list | grep -Ei "jax|numpy|scipy"
+      - name: probe
+        run: |
+          for f in probe*.py; do echo "=== $f"; python $f || true; done
