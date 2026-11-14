@@ -106,6 +106,10 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     `fp` value is infinite; it now returns the knot value or the signed
     infinity, matching NumPy. For complex `fp`, the real and imaginary parts
     are now interpolated separately, as in NumPy.
+  * Fixed {func}`jax.numpy.logspace` with a non-scalar `base`, which was not
+    broadcast against `start` and `stop` or expanded along `axis`, and so
+    returned wrongly shaped or wrongly paired results or raised an error.
+    `base` is now handled as in NumPy.
 
 ## JAX 0.12.0.1 (October 23, 2026)
 
