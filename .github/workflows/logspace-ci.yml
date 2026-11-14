@@ -1,0 +1,142 @@
+name: logspace-ci
+on:
+  push:
+    branches: ['ci/logspace-array-base']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        src: [fixed, baseline]
+        x64: ['0', '1']
+    runs-on: ubuntu-latest
+    env:
+      JAX_ENABLE_X64: ${{ matrix.x64 }}
+      JAX_NUM_GENERATED_CASES: '100000'
+      JAX_PLATFORMS: cpu
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install
+        run: |
+          python -m pip install -U pip
+          pip install -r build/test-requirements.txt
+          pip install -U numpy scipy ml_dtypes opt_einsum
+          pip install -U --pre jaxlib -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ --extra-index-url https://pypi.org/simple
+      - name: select source
+        run: |
+          # HEAD = this CI commit, HEAD~1 = fix commit, HEAD~2 = upstream main.
+          git log --oneline -3
+          if [ "${{ matrix.src }}" = baseline ]; then
+            git checkout HEAD~2 -- jax CHANGELOG.md
+            # Keep the new tests from the fix commit so they run against main.
+            git checkout HEAD~1 -- tests/lax_numpy_test.py
+          fi
+          git status --short
+          git diff HEAD~2 --stat -- jax tests
+          python -c "import jax, jaxlib, numpy; print(jax.__file__, jax.__version__, jaxlib.__version__, numpy.__version__)"
+      - name: new tests only (testLogspaceArrayBase)
+        run: |
+          pytest -n auto -q -rN tests/lax_numpy_test.py -k testLogspaceArrayBase --junitxml=new.xml 2>&1 | tail -25 || true
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          s = next(ET.parse('new.xml').getroot().iter('testsuite'))
+          print('NEW', {k: s.get(k) for k in ('tests', 'failures', 'errors', 'skipped')})
+          PY
+      - name: full linspace/logspace/geomspace groups
+        run: |
+          pytest -n auto -q -rN tests/lax_numpy_test.py -k "Logspace or Linspace or Geomspace" --junitxml=all.xml 2>&1 | tail -8 || true
+          python - <<'PY'
+          import xml.etree.ElementTree as ET, collections
+          root = ET.parse('all.xml').getroot()
+          c = collections.Counter()
+          for tc in root.iter('testcase'):
+            name = tc.get('name').split('_')[0].split('[')[0]
+            st = 'failed' if tc.find('failure') is not None or tc.find('error') is not None else ('skipped' if tc.find('skipped') is not None else 'passed')
+            c[(name, st)] += 1
+          for k in sorted(c): print('GROUP', k, c[k])
+          PY
+      - name: doctest of array_creation
+        run: |
+          pytest -q --doctest-modules jax/_src/numpy/array_creation.py 2>&1 | tail -5 || true
+      - name: reproducer vs numpy
+        run: |
+          python - <<'PY'
+          import numpy as np, jax, jax.numpy as jnp
+          cases = [
+            ((0., 2., 3), dict(base=np.array([2., 3., 10.]))),
+            ((np.array([0., 5.]), np.array([5., 0.]), 2), dict(base=np.array([2., 3.]), axis=1)),
+            ((np.array([0., 5.]), np.array([5., 0.]), 3), dict(base=np.array([2., 3.]), axis=1)),
+            ((0., 1., 4), dict(base=np.array([[2.], [3.]]), axis=-1)),
+            ((np.zeros((2, 3)), 1., 4), dict(base=np.array([2., 3., 4.]), axis=2, endpoint=False)),
+            ((np.array([0., 5.]), np.array([5., 0.]), 5), dict(base=np.array([2., 3.]))),
+          ]
+          for args, kw in cases:
+            ref = np.logspace(*args, **kw)
+            try:
+              out = jnp.logspace(*args, **kw)
+              jit_out = jax.jit(lambda s, t, b: jnp.logspace(s, t, args[2], **{**kw, 'base': b}))(args[0], args[1], kw['base'])
+              ok = out.shape == ref.shape and np.allclose(out, ref, rtol=1e-5) and np.allclose(jit_out, ref, rtol=1e-5)
+              print('REPRO', kw, 'np', ref.shape, 'jnp', out.shape, 'match' if ok else 'MISMATCH')
+            except Exception as e:
+              print('REPRO', kw, 'np', ref.shape, 'jnp raised', type(e).__name__, str(e)[:100])
+          PY
+      - name: scalar-base outputs and jaxprs
+        run: |
+          python - <<'PY'
+          import numpy as np, jax, jax.numpy as jnp, pickle, hashlib
+          out = {}
+          rng = np.random.default_rng(0)
+          s22 = rng.normal(size=(2, 2)).astype(np.float32)
+          s2 = rng.normal(size=(2,)).astype(np.float32)
+          cases = [
+            ('basic', lambda: jnp.logspace(0, 2, 5)),
+            ('base2', lambda: jnp.logspace(0, 2, 7, base=2)),
+            ('basee_noend', lambda: jnp.logspace(-1., 3., 11, endpoint=False, base=np.e)),
+            ('0d_np', lambda: jnp.logspace(s22, s2, 6, base=np.array(3.0), axis=-1)),
+            ('0d_jnp', lambda: jnp.logspace(s2, 1.5, 4, base=jnp.float32(7), axis=1)),
+            ('int_dtype', lambda: jnp.logspace(0, 3, 4, base=2, dtype=jnp.int32)),
+            ('f16', lambda: jnp.logspace(s2, s22, 5, dtype=jnp.float16)),
+            ('c64', lambda: jnp.logspace(s2, s2 + 1j, 5, base=2., dtype=jnp.complex64)),
+            ('num0', lambda: jnp.logspace(s2, s22, 0)),
+            ('num1', lambda: jnp.logspace(s2, s22, 1, base=2.5)),
+            ('jit_tracer_base', lambda: jax.jit(lambda b: jnp.logspace(s2, s22, 5, base=b))(2.5)),
+            ('grad', lambda: jax.grad(lambda x: jnp.logspace(x, 2., 5, base=3.).sum())(0.5)),
+          ]
+          for name, f in cases:
+            r = np.asarray(f())
+            out[name] = (r.dtype.str, r.shape, hashlib.sha256(r.tobytes()).hexdigest())
+          out['jaxpr'] = str(jax.make_jaxpr(lambda a, b: jnp.logspace(a, b, 5, base=2.))(s2, s22))
+          out['jaxpr0d'] = str(jax.make_jaxpr(lambda a, b, c: jnp.logspace(a, b, 5, base=c, axis=-1))(s2, s22, np.float32(2)))
+          for k, v in out.items():
+            if k.startswith('jaxpr'):
+              v = hashlib.sha256(v.encode()).hexdigest()
+            print('SCALAR', k, v)
+          PY
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: pre-commit on fix commit
+        run: |
+          pip install pre-commit
+          pre-commit run --show-diff-on-failure --color=never --files CHANGELOG.md jax/_src/numpy/array_creation.py tests/lax_numpy_test.py
+      - name: pre-commit on upstream main (pyrefly baseline)
+        if: always()
+        run: |
+          git checkout HEAD~2 -- jax tests CHANGELOG.md
+          pre-commit run --color=never --files CHANGELOG.md jax/_src/numpy/array_creation.py tests/lax_numpy_test.py || true
